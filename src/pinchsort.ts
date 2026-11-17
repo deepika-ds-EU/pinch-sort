@@ -50,6 +50,9 @@ let startedAt = 0;
 let finishedAt = 0;
 let nextLevelAt = 0;
 let lastHud = 0;
+let gameOver = false;
+let totalSecs = 0;
+let totalMistakes = 0;
 let lastNow = 0;
 let hudCanvas: HTMLCanvasElement | null = null;
 let hudCtx: CanvasRenderingContext2D | null = null;
@@ -173,6 +176,7 @@ export function setupPinchSort(world: World): void {
   startLevel(0);
   enableMouseDrag2(world);
   enableDropCheck(world);
+  window.addEventListener("pointerdown", () => { if (gameOver) { gameOver = false; totalSecs = 0; totalMistakes = 0; startLevel(0); } });
 }
 
 export class PinchSortSystem extends createSystem({}) {
@@ -187,7 +191,7 @@ export class PinchSortSystem extends createSystem({}) {
     });
 
     if (finishedAt > 0) {
-      if (now >= nextLevelAt) startLevel((level + 1) % LEVEL_SIZES.length);
+      if (level === LEVEL_SIZES.length - 1) { if (!gameOver) { gameOver = true; drawHud(["You finished all levels!", `Total ${totalSecs}s   Mistakes ${totalMistakes}`, "Click to play again"], "#ffd84d"); } else if (now >= nextLevelAt + 30000) { gameOver = false; totalSecs = 0; totalMistakes = 0; startLevel(0); } return; } if (now >= nextLevelAt) startLevel(level + 1);
       return;
     }
 
@@ -234,6 +238,8 @@ export class PinchSortSystem extends createSystem({}) {
       nextLevelAt = now + 5000;
       const secs = Math.round((now - startedAt) / 1000);
       const last = level === LEVEL_SIZES.length - 1;
+      totalSecs += secs;
+      totalMistakes += mistakes;
       drawHud(
         [
           'Level complete!',
@@ -463,3 +469,4 @@ function dropOrbScreen(orb: Orb, camera: any, canvas: HTMLCanvasElement): void {
     mistakes++;
   }
 }
+
