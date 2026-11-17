@@ -42,6 +42,8 @@ interface Orb {
 }
 
 const orbs: Orb[] = [];
+const spawnMap = new Map<Orb, Vector3>();
+const calmMap = new Map<Orb, { pos: Vector3; ms: number }>();
 const pads: Mesh[] = [];
 const padPulse = [0, 0, 0];
 let level = 0;
@@ -114,6 +116,8 @@ function startLevel(n: number): void {
     orb.mesh.visible = true;
     orb.mesh.position.set(x, START_Y + row * 0.1, START_Z);
     orb.last.set(x, START_Y + row * 0.1, START_Z);
+    spawnMap.set(orb, new Vector3(x, START_Y + row * 0.1, START_Z));
+    calmMap.delete(orb);
   });
 }
 
@@ -180,9 +184,57 @@ export function setupPinchSort(world: World): void {
 }
 
 export class PinchSortSystem extends createSystem({}) {
+  private headPos = new Vector3();
+  private vOrb = new Vector3();
+  private vPad = new Vector3();
+
+  checkAngle(dt: number): void {
+    if (finishedAt > 0) return;
+    this.player.head.updateWorldMatrix(true, false);
+    this.headPos.setFromMatrixPosition(this.player.head.matrixWorld);
+    for (const orb of orbs) {
+      if (!orb.active || orb.sorted) continue;
+      const home = spawnMap.get(orb);
+      const p = orb.mesh.position;
+      if (!home || p.distanceTo(home) < 0.04) continue;
+      let st = calmMap.get(orb);
+      if (!st) {
+        st = { pos: new Vector3().copy(p), ms: 0 };
+        calmMap.set(orb, st);
+      }
+      const moved = p.distanceTo(st.pos);
+      st.pos.copy(p);
+      st.ms = moved < 0.02 ? st.ms + dt : 0;
+      if (st.ms < 150) continue;
+      this.vOrb.copy(p).sub(this.headPos);
+      let best = -1;
+      let bestA = 1;
+      for (let j = 0; j < 3; j++) {
+        this.vPad.set(PAD_X[j], PAD_Y, PAD_Z).sub(this.headPos);
+        const a = this.vOrb.angleTo(this.vPad);
+        if (a < bestA) {
+          bestA = a;
+          best = j;
+        }
+      }
+      if (best < 0 || bestA > 0.17) continue;
+      if (orb.colorIndex !== best && (bestA > 0.1 || p.distanceTo(home) < 0.15)) continue;
+      console.log('XRDROP', 'orb', orb.colorIndex, 'pad', best, 'angle', bestA.toFixed(3));
+      if (orb.colorIndex === best) {
+        orb.sorted = true;
+        orb.mesh.visible = false;
+        orb.mesh.position.set(0, -5, 0);
+        padPulse[best] = 1;
+      } else {
+        mistakes++;
+        st.ms = -4000;
+      }
+    }
+  }
   update(): void {
     const now = performance.now();
     const dt = now - lastNow;
+    this.checkAngle(dt);
     lastNow = now;
 
     padPulse.forEach((value, i) => {
@@ -469,4 +521,6 @@ function dropOrbScreen(orb: Orb, camera: any, canvas: HTMLCanvasElement): void {
     mistakes++;
   }
 }
+
+
 
