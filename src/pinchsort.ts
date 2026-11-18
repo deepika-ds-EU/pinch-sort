@@ -17,6 +17,7 @@ import {
   World,
   createSystem,
 } from '@iwsdk/core';
+import * as IWSDK from '@iwsdk/core';
 
 const COLORS = [0xff4d4d, 0x4dd2ff, 0xffd84d];
 const PAD_X = [-0.3, 0, 0.3];
@@ -24,26 +25,47 @@ const PAD_Y = 0.81;
 const PAD_Z = -0.7;
 const PAD_RADIUS = 0.15;
 const PAD_VISUAL = 0.13;
-const DROP_HEIGHT = 1.2;
+const DROP_MIN_Y = 0.6;
+const DROP_MAX_Y = 1.6;
 const START_Y = 1.05;
 const START_Z = -0.4;
 const LEVEL_SIZES = [6, 9, 12, 15];
 const MAX_ORBS = 15;
-const DEBUG = false;
+
+// How a drop is detected
+// ----------------------
+// A drop happens when you RELEASE an orb (the SDK's "Pressed" state ends).
+// Merely pointing the ray at an orb, or clicking it without moving it, is not
+// a drop: a drop only counts if the orb ended up more than ARM_DISTANCE away
+// from where its previous drop was resolved (or from where it started).
+// If the SDK never reports the pressed state, we fall back to "the orb has
+// stayed still for STILL_MS".
+const ARM_DISTANCE = 0.04;
+const RELEASE_DELAY_MS = 150;
+const STILL_MS = 250;
+const CALM_RADIUS = 0.02;
+// How close (in radians, seen from the player's eyes) an orb has to look to a
+// pad to count as dropped on it. Distance-grab keeps the orb on the ray, so it
+// often floats in front of the pad while looking like it is on it.
+const VISUAL_ANGLE = 0.15;
+
+const PressedComponent = (IWSDK as any).Pressed;
+let pressedSeen = false;
 
 interface Orb {
   mesh: Mesh;
+  entity: any;
   colorIndex: number;
   sorted: boolean;
   active: boolean;
-  locked: boolean;
+  wasHeld: boolean;
+  dropAt: number;
   still: number;
-  last: Vector3;
+  anchor: Vector3;
+  calm: Vector3;
 }
 
 const orbs: Orb[] = [];
-const spawnMap = new Map<Orb, Vector3>();
-const calmMap = new Map<Orb, { pos: Vector3; ms: number }>();
 const pads: Mesh[] = [];
 const padPulse = [0, 0, 0];
 let level = 0;
@@ -96,8 +118,9 @@ function startLevel(n: number): void {
   const perRow = count > 9 ? Math.ceil(count / 2) : count;
   orbs.forEach((orb, i) => {
     orb.sorted = false;
-    orb.locked = false;
     orb.still = 0;
+    orb.wasHeld = false;
+    orb.dropAt = 0;
     orb.active = i < count;
     if (!orb.active) {
       orb.mesh.visible = false;
@@ -113,11 +136,11 @@ function startLevel(n: number): void {
     const col = i % perRow;
     const rowCount = row === 0 ? perRow : count - perRow;
     const x = (col - (rowCount - 1) / 2) * 0.1;
+    const y = START_Y + row * 0.1;
     orb.mesh.visible = true;
-    orb.mesh.position.set(x, START_Y + row * 0.1, START_Z);
-    orb.last.set(x, START_Y + row * 0.1, START_Z);
-    spawnMap.set(orb, new Vector3(x, START_Y + row * 0.1, START_Z));
-    calmMap.delete(orb);
+    orb.mesh.position.set(x, y, START_Z);
+    orb.anchor.set(x, y, START_Z);
+    orb.calm.set(x, y, START_Z);
   });
 }
 
@@ -162,25 +185,43 @@ export function setupPinchSort(world: World): void {
     );
     const entity = world.createTransformEntity(mesh);
     entity.addComponent(RayInteractable);
-        entity.addComponent(DistanceGrabbable, {
+    entity.addComponent(DistanceGrabbable, {
       movementMode: MovementMode.MoveFromTarget,
     });
     orbs.push({
       mesh,
+      entity,
       colorIndex: 0,
       sorted: false,
       active: false,
-      locked: false,
+      wasHeld: false,
+      dropAt: 0,
       still: 0,
-      last: new Vector3(),
+      anchor: new Vector3(),
+      calm: new Vector3(),
     });
   }
 
+  console.log('PINCHSORT pressed-state tracking available:', !!PressedComponent);
   lastNow = performance.now();
   startLevel(0);
-  enableMouseDrag2(world);
-  enableDropCheck(world);
-  window.addEventListener("pointerdown", () => { if (gameOver) { gameOver = false; totalSecs = 0; totalMistakes = 0; startLevel(0); } });
+  enableMouseDrag(world);
+  enableMouseDrop(world);
+  window.addEventListener('pointerdown', () => {
+    if (gameOver) {
+      gameOver = false;
+      totalSecs = 0;
+      totalMistakes = 0;
+      startLevel(0);
+    }
+  });
+}
+
+function sortOrb(orb: Orb, pad: number): void {
+  orb.sorted = true;
+  orb.mesh.visible = false;
+  orb.mesh.position.set(0, -5, 0);
+  padPulse[pad] = 1;
 }
 
 export class PinchSortSystem extends createSystem({}) {
@@ -188,53 +229,60 @@ export class PinchSortSystem extends createSystem({}) {
   private vOrb = new Vector3();
   private vPad = new Vector3();
 
-  checkAngle(dt: number): void {
-    if (finishedAt > 0) return;
-    this.player.head.updateWorldMatrix(true, false);
-    this.headPos.setFromMatrixPosition(this.player.head.matrixWorld);
-    for (const orb of orbs) {
-      if (!orb.active || orb.sorted) continue;
-      const home = spawnMap.get(orb);
-      const p = orb.mesh.position;
-      if (!home || p.distanceTo(home) < 0.04) continue;
-      let st = calmMap.get(orb);
-      if (!st) {
-        st = { pos: new Vector3().copy(p), ms: 0 };
-        calmMap.set(orb, st);
-      }
-      const moved = p.distanceTo(st.pos);
-      st.pos.copy(p);
-      st.ms = moved < 0.02 ? st.ms + dt : 0;
-      if (st.ms < 150) continue;
-      this.vOrb.copy(p).sub(this.headPos);
-      let best = -1;
-      let bestA = 1;
+  // Which pad is this point over? First by position (straight above the pad),
+  // then as seen from the player's eyes, so a drop that looks right counts.
+  // Returns -1 when the point is not over any pad.
+  private padAt(p: Vector3): number {
+    let best = -1;
+    let bestD = PAD_RADIUS;
+    if (p.y > DROP_MIN_Y && p.y < DROP_MAX_Y) {
       for (let j = 0; j < 3; j++) {
-        this.vPad.set(PAD_X[j], PAD_Y, PAD_Z).sub(this.headPos);
-        const a = this.vOrb.angleTo(this.vPad);
-        if (a < bestA) {
-          bestA = a;
+        const d = Math.hypot(p.x - PAD_X[j], p.z - PAD_Z);
+        if (d < bestD) {
+          bestD = d;
           best = j;
         }
       }
-      if (best < 0 || bestA > 0.17) continue;
-      if (orb.colorIndex !== best && (bestA > 0.1 || p.distanceTo(home) < 0.15)) continue;
-      console.log('XRDROP', 'orb', orb.colorIndex, 'pad', best, 'angle', bestA.toFixed(3));
-      if (orb.colorIndex === best) {
-        orb.sorted = true;
-        orb.mesh.visible = false;
-        orb.mesh.position.set(0, -5, 0);
-        padPulse[best] = 1;
-      } else {
-        mistakes++;
-        st.ms = -4000;
+    }
+    if (best >= 0) return best;
+
+    this.vOrb.copy(p).sub(this.headPos);
+    let bestA = VISUAL_ANGLE;
+    for (let j = 0; j < 3; j++) {
+      this.vPad.set(PAD_X[j], PAD_Y, PAD_Z);
+      if (p.distanceTo(this.vPad) > 0.7) continue;
+      this.vPad.sub(this.headPos);
+      const a = this.vOrb.angleTo(this.vPad);
+      if (a < bestA) {
+        bestA = a;
+        best = j;
       }
     }
+    return best;
   }
+
+  // Called once per drop. Counts at most one result per drop, and only if the
+  // orb really moved since its previous drop.
+  private resolveDrop(orb: Orb): void {
+    const p = orb.mesh.position;
+    if (p.distanceTo(orb.anchor) <= ARM_DISTANCE) return;
+    orb.anchor.copy(p);
+    const pad = this.padAt(p);
+    if (pad < 0) {
+      console.log('DROP-NOT-ON-PAD', 'x', p.x.toFixed(2), 'y', p.y.toFixed(2), 'z', p.z.toFixed(2));
+      return;
+    }
+    if (orb.colorIndex === pad) {
+      sortOrb(orb, pad);
+      return;
+    }
+    mistakes++;
+    console.log('MISTAKE', 'orb', orb.colorIndex, 'pad', pad);
+  }
+
   update(): void {
     const now = performance.now();
-    const dt = now - lastNow;
-    this.checkAngle(dt);
+    const dt = Math.min(now - lastNow, 100);
     lastNow = now;
 
     padPulse.forEach((value, i) => {
@@ -243,43 +291,69 @@ export class PinchSortSystem extends createSystem({}) {
     });
 
     if (finishedAt > 0) {
-      if (level === LEVEL_SIZES.length - 1) { if (!gameOver) { gameOver = true; drawHud(["You finished all levels!", `Total ${totalSecs}s   Mistakes ${totalMistakes}`, "Click to play again"], "#ffd84d"); } else if (now >= nextLevelAt + 30000) { gameOver = false; totalSecs = 0; totalMistakes = 0; startLevel(0); } return; } if (now >= nextLevelAt) startLevel(level + 1);
+      if (level === LEVEL_SIZES.length - 1) {
+        if (!gameOver) {
+          gameOver = true;
+          drawHud(
+            [
+              'You finished all levels!',
+              `Total ${totalSecs}s   Mistakes ${totalMistakes}`,
+              'Click to play again',
+            ],
+            '#ffd84d',
+          );
+        } else if (now >= nextLevelAt + 30000) {
+          gameOver = false;
+          totalSecs = 0;
+          totalMistakes = 0;
+          startLevel(0);
+        }
+        return;
+      }
+      if (now >= nextLevelAt) startLevel(level + 1);
       return;
     }
 
+    this.player.head.updateWorldMatrix(true, false);
+    this.headPos.setFromMatrixPosition(this.player.head.matrixWorld);
+
     let remaining = 0;
-    let dbg = '';
-    let best = 99;
     for (const orb of orbs) {
       if (!orb.active || orb.sorted) continue;
       const p = orb.mesh.position;
-      for (let k = 0; k < 3; k++) { const d = Math.hypot(p.x - PAD_X[k], p.z - PAD_Z); if (d < best) { best = d; dbg = `x${p.x.toFixed(2)} y${p.y.toFixed(2)} z${p.z.toFixed(2)} d${d.toFixed(2)}`; } }
-      let padHit = -1;
-      for (let j = 0; j < 3; j++) {
-        const close = Math.hypot(p.x - PAD_X[j], p.z - PAD_Z) < PAD_RADIUS;
-        if (close && p.y < DROP_HEIGHT && p.y > 0.7) padHit = j;
-      }
-      if (padHit < 0) {
-        orb.locked = false;
-        orb.still = 0;
-        orb.last.copy(p);
-        remaining++;
-        continue;
-      }
-      const moved = p.distanceTo(orb.last);
-      orb.last.copy(p);
-      orb.still = moved < 0.005 ? orb.still + dt : 0;
-      if (!orb.locked && orb.still >= 250) {
-        if (orb.colorIndex === padHit) {
-          orb.sorted = true;
-          orb.mesh.visible = false;
-          orb.mesh.position.set(0, -5, 0);
-          padPulse[padHit] = 1;
-          continue;
+
+      // Is the orb being held right now? A release starts a short timer, and
+      // the drop is judged when it ends.
+      const held = PressedComponent ? !!orb.entity.hasComponent(PressedComponent) : false;
+      let resolveNow = false;
+      if (held) {
+        if (!pressedSeen) {
+          pressedSeen = true;
+          console.log('PRESSED-SEEN');
         }
-        mistakes++;
-        orb.locked = true;
+        orb.wasHeld = true;
+        orb.dropAt = 0;
+      } else if (orb.wasHeld) {
+        orb.wasHeld = false;
+        orb.dropAt = now + RELEASE_DELAY_MS;
+      }
+      if (orb.dropAt > 0 && now >= orb.dropAt) {
+        orb.dropAt = 0;
+        resolveNow = true;
+      }
+
+      // Fallback only if the SDK never reports the pressed state.
+      if (p.distanceTo(orb.calm) > CALM_RADIUS) {
+        orb.calm.copy(p);
         orb.still = 0;
+      } else {
+        orb.still += dt;
+      }
+      if (!pressedSeen && orb.still >= STILL_MS) resolveNow = true;
+
+      if (resolveNow) {
+        this.resolveDrop(orb);
+        if (orb.sorted) continue;
       }
       remaining++;
     }
@@ -309,7 +383,7 @@ export class PinchSortSystem extends createSystem({}) {
         [
           `Pinch Sort - Level ${level + 1}/${LEVEL_SIZES.length}`,
           `Sorted ${count - remaining} / ${count}   Mistakes ${mistakes}`,
-          `Time ${secs}s${DEBUG ? "  " + dbg : ""}`,
+          `Time ${secs}s`,
         ],
         '#4dd2ff',
       );
@@ -317,66 +391,20 @@ export class PinchSortSystem extends createSystem({}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Desktop mouse mode (judges without a headset)
+// ---------------------------------------------------------------------------
 
-function enableMouseDrag(world: World): void {
-  const canvas = world.renderer.domElement;
-  const raycaster = new Raycaster();
-  const pointer = new Vector2();
-  const plane = new Plane(new Vector3(0, 1, 0), -0.86);
-  const hit = new Vector3();
-  let dragging: Orb | null = null;
-
-  const aim = (e: PointerEvent): void => {
-    const r = canvas.getBoundingClientRect();
-    pointer.set(
-      ((e.clientX - r.left) / r.width) * 2 - 1,
-      -((e.clientY - r.top) / r.height) * 2 + 1,
-    );
-    raycaster.setFromCamera(pointer, world.camera);
-  };
-
-  canvas.addEventListener('pointerdown', (e: PointerEvent) => {
-    if (world.renderer.xr.isPresenting) return;
-    aim(e);
-    const meshes = orbs.filter((o) => o.active && !o.sorted).map((o) => o.mesh);
-    const hits = raycaster.intersectObjects(meshes, false);
-    if (hits.length === 0) return;
-    dragging = orbs.find((o) => o.mesh === hits[0].object) ?? null;
-    if (dragging) {
-      dragging.still = 0;
-      canvas.setPointerCapture(e.pointerId);
-    }
-  });
-
-  canvas.addEventListener('pointermove', (e: PointerEvent) => {
-    if (!dragging) return;
-    aim(e);
-    if (raycaster.ray.intersectPlane(plane, hit)) {
-      dragging.mesh.position.set(hit.x, 0.86, hit.z);
-    }
-  });
-
-  const release = (): void => {
-    dragging = null;
-  };
-  canvas.addEventListener('pointerup', release);
-  canvas.addEventListener('pointercancel', release);
+function getCanvas(w: any): HTMLCanvasElement | null {
+  return w.renderer?.domElement ?? (document.querySelector('canvas') as HTMLCanvasElement | null);
 }
 
-
-
-
-
-function enableMouseDrag2(world: World): void {
+function enableMouseDrag(world: World): void {
   try {
     const w = world as any;
     const camera = w.camera;
-    const canvas: HTMLCanvasElement | null =
-      w.renderer?.domElement ?? (document.querySelector('canvas') as HTMLCanvasElement | null);
-    if (!camera || !canvas) {
-      alert('Mouse setup failed. world keys: ' + Object.keys(w).join(', '));
-      return;
-    }
+    const canvas = getCanvas(w);
+    if (!camera || !canvas) return;
     const raycaster = new Raycaster();
     const pointer = new Vector2();
     const plane = new Plane(new Vector3(0, 1, 0), -0.86);
@@ -428,33 +456,11 @@ function enableMouseDrag2(world: World): void {
   }
 }
 
-
-function dropOrb(orb: Orb): void {
-  if (!orb.active || orb.sorted || finishedAt > 0) return;
-  const p = orb.mesh.position;
-  for (let j = 0; j < 3; j++) {
-    const close = Math.hypot(p.x - PAD_X[j], p.z - PAD_Z) < PAD_RADIUS;
-    if (close && p.y < DROP_HEIGHT && p.y > 0.7) {
-      if (orb.colorIndex === j) {
-        orb.sorted = true;
-        orb.mesh.visible = false;
-        orb.mesh.position.set(0, -5, 0);
-        padPulse[j] = 1;
-      } else {
-        mistakes++;
-        orb.locked = true;
-      }
-      return;
-    }
-  }
-}
-
-function enableDropCheck(world: World): void {
+function enableMouseDrop(world: World): void {
   try {
     const w = world as any;
     const camera = w.camera;
-    const canvas: HTMLCanvasElement | null =
-      w.renderer?.domElement ?? (document.querySelector('canvas') as HTMLCanvasElement | null);
+    const canvas = getCanvas(w);
     if (!camera || !canvas) return;
     const raycaster = new Raycaster();
     const pointer = new Vector2();
@@ -463,6 +469,8 @@ function enableDropCheck(world: World): void {
     window.addEventListener(
       'pointerdown',
       (e: PointerEvent) => {
+        held = null;
+        if (w.renderer?.xr?.isPresenting) return;
         const r = canvas.getBoundingClientRect();
         pointer.set(
           ((e.clientX - r.left) / r.width) * 2 - 1,
@@ -477,6 +485,10 @@ function enableDropCheck(world: World): void {
     );
 
     const drop = (): void => {
+      if (w.renderer?.xr?.isPresenting) {
+        held = null;
+        return;
+      }
       if (held) {
         dropOrbScreen(held, camera, canvas);
         held = null;
@@ -488,7 +500,6 @@ function enableDropCheck(world: World): void {
     alert('Drop setup error: ' + String(err));
   }
 }
-
 
 function dropOrbScreen(orb: Orb, camera: any, canvas: HTMLCanvasElement): void {
   if (!orb.active || orb.sorted || finishedAt > 0) return;
@@ -510,17 +521,11 @@ function dropOrbScreen(orb: Orb, camera: any, canvas: HTMLCanvasElement): void {
     }
   }
   const limit = rect.width * 0.07;
-  console.log('DROP', 'orbColor', orb.colorIndex, 'nearestPad', best, 'dist', Math.round(bestD), 'limit', Math.round(limit), 'pos', p.x.toFixed(2), p.y.toFixed(2), p.z.toFixed(2));
   if (best < 0 || bestD > limit) return;
   if (orb.colorIndex === best) {
-    orb.sorted = true;
-    orb.mesh.visible = false;
-    orb.mesh.position.set(0, -5, 0);
-    padPulse[best] = 1;
-  } else {
+    sortOrb(orb, best);
+  } else if (p.distanceTo(orb.anchor) > ARM_DISTANCE) {
     mistakes++;
+    orb.anchor.copy(p);
   }
 }
-
-
-
