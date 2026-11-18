@@ -82,6 +82,62 @@ let hudCanvas: HTMLCanvasElement | null = null;
 let hudCtx: CanvasRenderingContext2D | null = null;
 let hudTexture: CanvasTexture | null = null;
 
+// ---------------------------------------------------------------------------
+// Sound effects, generated in code (no audio files). Press M to mute/unmute.
+// ---------------------------------------------------------------------------
+let audioCtx: AudioContext | null = null;
+let muted = false;
+
+function getAudio(): AudioContext | null {
+  try {
+    if (!audioCtx) {
+      const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!Ctor) return null;
+      audioCtx = new Ctor() as AudioContext;
+    }
+    if (audioCtx.state === 'suspended') void audioCtx.resume();
+    return audioCtx;
+  } catch {
+    return null;
+  }
+}
+
+function tone(freq: number, start: number, dur: number, type: OscillatorType, vol: number): void {
+  if (muted) return;
+  const ctx = getAudio();
+  if (!ctx) return;
+  try {
+    const t0 = ctx.currentTime + start;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  } catch {
+    // Sound is a bonus; never let it break the game.
+  }
+}
+
+function playCorrect(): void {
+  tone(659.25, 0, 0.18, 'sine', 0.25);
+  tone(880, 0.09, 0.3, 'sine', 0.25);
+}
+
+function playWrong(): void {
+  tone(196, 0, 0.25, 'sawtooth', 0.1);
+  tone(155.56, 0.12, 0.3, 'sawtooth', 0.1);
+}
+
+function playLevelDone(): void {
+  [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, 0.3 + i * 0.12, 0.3, 'triangle', 0.22));
+}
+
 function shuffle(items: number[]): number[] {
   for (let i = items.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -203,6 +259,15 @@ export function setupPinchSort(world: World): void {
   }
 
   console.log('PINCHSORT pressed-state tracking available:', !!PressedComponent);
+  // Browsers only allow sound after a click, tap or key press, so wake the
+  // audio up on the first one. Press M to mute or unmute.
+  ['pointerdown', 'touchstart', 'keydown'].forEach((name) =>
+    window.addEventListener(name, () => void getAudio(), { passive: true }),
+  );
+  window.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'm' || e.key === 'M') muted = !muted;
+  });
+
   lastNow = performance.now();
   startLevel(0);
   enableMouseDrag(world);
@@ -222,6 +287,7 @@ function sortOrb(orb: Orb, pad: number): void {
   orb.mesh.visible = false;
   orb.mesh.position.set(0, -5, 0);
   padPulse[pad] = 1;
+  playCorrect();
 }
 
 export class PinchSortSystem extends createSystem({}) {
@@ -277,6 +343,7 @@ export class PinchSortSystem extends createSystem({}) {
       return;
     }
     mistakes++;
+    playWrong();
     console.log('MISTAKE', 'orb', orb.colorIndex, 'pad', pad);
   }
 
@@ -362,6 +429,7 @@ export class PinchSortSystem extends createSystem({}) {
     if (remaining === 0) {
       finishedAt = now;
       nextLevelAt = now + 5000;
+      playLevelDone();
       const secs = Math.round((now - startedAt) / 1000);
       const last = level === LEVEL_SIZES.length - 1;
       totalSecs += secs;
@@ -526,6 +594,7 @@ function dropOrbScreen(orb: Orb, camera: any, canvas: HTMLCanvasElement): void {
     sortOrb(orb, best);
   } else if (p.distanceTo(orb.anchor) > ARM_DISTANCE) {
     mistakes++;
+    playWrong();
     orb.anchor.copy(p);
   }
 }
